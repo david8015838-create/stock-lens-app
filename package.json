@@ -8,9 +8,7 @@
     "build": "echo 'Static site — no build step required'",
     "start": "vercel dev"
   },
-  "dependencies": {
-    "yahoo-finance2": "^2.11.3"
-  },
+  "dependencies": {},
   "engines": {
     "node": "22.x"
   }
