@@ -1,0 +1,17 @@
+{
+  "name": "stock-lens",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time stock portfolio tracker with Yahoo Finance live prices",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'Static site — no build step required'",
+    "start": "vercel dev"
+  },
+  "dependencies": {
+    "yahoo-finance2": "^2.11.3"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
