@@ -1,4 +1,4 @@
-// Pure Node.js built-in https — zero external dependencies
+// Zero dependencies — pure Node.js https, no crumb needed for chart API
 const https = require('https');
 
 const USER_AGENTS = [
@@ -9,85 +9,52 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
 ];
 
-function randomUA() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+const VERSIONS = ['v8', 'v7', 'v6'];
+const HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
 
-// Module-level crumb cache — survives across warm invocations
-let _crumb = null;
-let _cookie = null;
-let _cacheTs = 0;
-const CRUMB_TTL = 25 * 60 * 1000; // 25 min
+function rand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
 function resolveSymbol(ticker) {
   const t = ticker.trim().toUpperCase();
   if (t.includes('.') || t.startsWith('^') || t.endsWith('-USD') || t.endsWith('-USDT')) return t;
-  if (/^\d{4}$/.test(t)) return `${t}.TW`;   // Taiwan listed
+  if (/^\d{4}$/.test(t)) return `${t}.TW`;   // Taiwan listed stock
   if (/^\d{5}$/.test(t)) return `${t}.TWO`;  // Taiwan OTC
   return t;
 }
 
-function httpsGet(url, headers, timeoutMs = 8000) {
+function fetchJson(url, headers, timeoutMs = 9000) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, { headers }, (res) => {
       let body = '';
-      const cookies = res.headers['set-cookie'] || [];
       res.on('data', c => (body += c));
-      res.on('end', () => resolve({ body, cookies, status: res.statusCode }));
+      res.on('end', () => {
+        if (res.statusCode === 429) return reject(new Error('rate_limited'));
+        try { resolve(JSON.parse(body)); }
+        catch (e) { reject(new Error(`parse_error: ${body.slice(0, 80)}`)); }
+      });
     });
     req.on('error', reject);
-    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('timeout')); });
   });
-}
-
-async function ensureCrumb() {
-  if (_crumb && Date.now() - _cacheTs < CRUMB_TTL) return;
-
-  const ua = randomUA();
-
-  // Step 1 — get Yahoo cookie (fc.yahoo.com is faster than finance.yahoo.com)
-  const { cookies } = await httpsGet(
-    'https://fc.yahoo.com/',
-    { 'User-Agent': ua, 'Accept': 'text/html' }
-  );
-  const cookie = cookies.map(c => c.split(';')[0]).join('; ');
-
-  // Step 2 — get crumb
-  const { body: crumb } = await httpsGet(
-    'https://query1.finance.yahoo.com/v1/test/getcrumb',
-    { 'User-Agent': ua, 'Cookie': cookie }
-  );
-
-  _crumb = crumb.trim();
-  _cookie = cookie;
-  _cacheTs = Date.now();
 }
 
 async function fetchQuote(symbol) {
-  const cacheBust = Date.now();
-  // Randomly rotate between v6/v7/v8 chart endpoint
-  const ver = ['v6', 'v7', 'v8'][Math.floor(Math.random() * 3)];
-  const url = `https://query1.finance.yahoo.com/${ver}/finance/chart/${encodeURIComponent(symbol)}` +
-    `?interval=1d&range=1d&crumb=${encodeURIComponent(_crumb)}&_=${cacheBust}`;
+  const ver = rand(VERSIONS);
+  const host = rand(HOSTS);
+  const cb = Date.now();
+  const url = `https://${host}/${ver}/finance/chart/${encodeURIComponent(symbol)}` +
+    `?interval=1d&range=1d&_=${cb}`;
 
-  const { body, status } = await httpsGet(url, {
-    'User-Agent': randomUA(),
-    'Cookie': _cookie,
+  const headers = {
+    'User-Agent': rand(USER_AGENTS),
     'Accept': 'application/json',
     'Accept-Language': 'en-US,en;q=0.9',
     'Referer': 'https://finance.yahoo.com/',
-    'Origin': 'https://finance.yahoo.com',
-  });
+  };
 
-  if (status === 401 || status === 403) {
-    // Force crumb refresh on next call
-    _crumb = null;
-    throw new Error(`Auth error ${status}`);
-  }
-
-  const json = JSON.parse(body);
+  const json = await fetchJson(url, headers);
   const result = json?.chart?.result?.[0];
-  if (!result) throw new Error(json?.chart?.error?.description || 'No data');
+  if (!result) throw new Error(json?.chart?.error?.description || 'no_data');
 
   const meta = result.meta;
   const price = meta.regularMarketPrice ?? null;
@@ -117,20 +84,6 @@ module.exports = async (req, res) => {
 
   const tickerList = symbols.split(',').map(s => s.trim()).filter(Boolean).slice(0, 30);
 
-  // Always return 200 — errors are embedded per-symbol
-  try {
-    await ensureCrumb();
-  } catch (e) {
-    return res.status(200).json({
-      results: tickerList.map(t => ({
-        rawTicker: t, symbol: resolveSymbol(t),
-        price: null, change: null, changePercent: null,
-        name: t, currency: 'USD', error: `Crumb fetch failed: ${e.message}`,
-      })),
-      ts: Date.now(),
-    });
-  }
-
   const results = await Promise.all(
     tickerList.map(async (rawTicker) => {
       const symbol = resolveSymbol(rawTicker);
@@ -138,15 +91,23 @@ module.exports = async (req, res) => {
         const data = await fetchQuote(symbol);
         return { rawTicker, symbol, ...data, error: null };
       } catch (err) {
+        // Retry once with the other host on rate_limited or parse errors
+        if (err.message === 'rate_limited' || err.message.startsWith('parse_error')) {
+          try {
+            const data = await fetchQuote(symbol);
+            return { rawTicker, symbol, ...data, error: null };
+          } catch {}
+        }
         return {
           rawTicker, symbol,
           price: null, change: null, changePercent: null,
           name: rawTicker, currency: 'USD',
-          error: String(err.message || err),
+          error: err.message,
         };
       }
     })
   );
 
+  // Always 200 — errors are per-symbol, never crash the frontend
   return res.status(200).json({ results, ts: Date.now() });
 };
